@@ -8,4 +8,4 @@ First, download the pre-trained weights:
 
 Then, you can run predictions:
 
-    cog predict -i prompt="360 degree equirectangular panorama photo, interior of wooden house, qxj <lora:360Diffusion_v1:1>"
+    cog predict -i prompt="photo, interior of wooden house, qxj <lora:360Diffusion_v1:1>"
