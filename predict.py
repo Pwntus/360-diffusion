@@ -1,5 +1,4 @@
 import os
-import shutil
 from typing import Iterator
 
 import torch
@@ -13,16 +12,32 @@ from diffusers import (
     HeunDiscreteScheduler,
     LMSDiscreteScheduler,
     PNDMScheduler,
-    StableDiffusionPipeline,
+    DiffusionPipeline,
     UniPCMultistepScheduler,
 )
-from diffusers.utils import load_image
+from diffusers.pipelines.stable_diffusion.safety_checker import (
+    StableDiffusionSafetyChecker,
+)
 
 
-MODEL_ID = "prompthero/openjourney-v4"
-LORA_MODEL_ID = "ProGamerGov/360-Diffusion-LoRA-sd-v1-5"
-LORA_FILE_NAME = "360Diffusion_v1.safetensors"
+MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
+LORA_MODEL_ID = "artificialguybr/360Redmond"
+LORA_FILE_NAME = "View360.safetensors"
 MODEL_CACHE = "diffusers-cache"
+SAFETY_CACHE = "safety-cache"
+
+
+def patch_conv(**patch):
+    cls = torch.nn.Conv2d
+    init = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        return init(self, *args, **kwargs, **patch)
+
+    cls.__init__ = __init__
+
+
+patch_conv(padding_mode="circular")
 
 
 class Predictor(BasePredictor):
@@ -31,23 +46,21 @@ class Predictor(BasePredictor):
         print("Loading pipeline...")
 
         print("Loading txt2img...")
-        self.txt2img_pipe = StableDiffusionPipeline.from_pretrained(
+        self.txt2img_pipe = DiffusionPipeline.from_pretrained(
             MODEL_ID,
-            torch_dtype=torch.float16,
             cache_dir=MODEL_CACHE,
             local_files_only=True,
+            torch_dtype=torch.float16,
+            use_safetensors=True,
+            variant="fp16",
         ).to("cuda")
 
         self.txt2img_pipe.load_lora_weights(
             ".", weight_name=f"./{MODEL_CACHE}/{LORA_FILE_NAME}")
 
-        self.safety_checker = self.txt2img_pipe.safety_checker
-
-        print("Loading compel...")
-        self.compel = Compel(
-            tokenizer=self.txt2img_pipe.tokenizer,
-            text_encoder=self.txt2img_pipe.text_encoder,
-        )
+        self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
+            SAFETY_CACHE, torch_dtype=torch.float16
+        ).to("cuda")
 
     @torch.inference_mode()
     def predict(
@@ -58,19 +71,19 @@ class Predictor(BasePredictor):
         ),
         negative_prompt: str = Input(
             description="Specify things to not see in the output",
-            default=None,
+            default="",
         ),
         width: int = Input(
-            description="Width of output image. Maximum size is 1024x768 or 768x1024 because of memory limits",
+            description="Width of output image.",
             choices=[128, 256, 384, 448, 512, 576,
-                     640, 704, 768, 832, 896, 960, 1024],
-            default=512,
+                     640, 704, 768, 832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536, 1600],
+            default=1600,
         ),
         height: int = Input(
-            description="Height of output image. Maximum size is 1024x768 or 768x1024 because of memory limits",
+            description="Height of output image.",
             choices=[128, 256, 384, 448, 512, 576,
-                     640, 704, 768, 832, 896, 960, 1024],
-            default=512,
+                     640, 704, 768, 832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536, 1600],
+            default=768,
         ),
         num_outputs: int = Input(
             description="Number of images to output.",
@@ -115,28 +128,12 @@ class Predictor(BasePredictor):
             seed = int.from_bytes(os.urandom(2), "big")
         print(f"Using seed: {seed}")
 
-        if width * height > 786432:
-            raise ValueError(
-                "Maximum size is 1024x768 or 768x1024 pixels, because of memory limits. Please select a lower width or height."
-            )
+        # if width * height > 786432:
+        #    raise ValueError(
+        #        "Maximum size is 1024x768 or 768x1024 pixels, because of memory limits. Please select a lower width or height."
+        #    )
 
         pipe.scheduler = make_scheduler(scheduler, pipe.scheduler.config)
-
-        if prompt:
-            print("parsed prompt:", self.compel.parse_prompt_string(prompt))
-            prompt_embeds = self.compel(prompt)
-        else:
-            prompt_embeds = None
-
-        if negative_prompt:
-            print(
-                "parsed negative prompt:",
-                self.compel.parse_prompt_string(negative_prompt),
-            )
-            negative_prompt_embeds = self.compel(negative_prompt)
-        else:
-            negative_prompt_embeds = None
-
         pipe.safety_checker = self.safety_checker
 
         result_count = 0
@@ -144,8 +141,8 @@ class Predictor(BasePredictor):
             this_seed = seed + idx
             generator = torch.Generator("cuda").manual_seed(this_seed)
             output = pipe(
-                prompt_embeds=prompt_embeds,
-                negative_prompt_embeds=negative_prompt_embeds,
+                prompt=[prompt] * num_outputs,
+                negative_prompt=[negative_prompt] * num_outputs,
                 guidance_scale=guidance_scale,
                 generator=generator,
                 num_inference_steps=num_inference_steps,

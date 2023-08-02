@@ -3,21 +3,21 @@ build:
   cuda: "11.6"
   python_version: "3.10"
   python_packages:
-    - "diffusers==0.17.1"
+    - "diffusers==0.19.3"
+    - "safetensors==0.3.1"
+    - "transformers==4.31.0"
+    - "accelerate==0.21.0"
+    - "invisible_watermark==0.2.0"
     - "opencv-contrib-python==4.6.0.66"
-    - "torchvision==0.15.1"
+    - "torchvision==0.15.2"
     - "timm==0.6.12"
-    - "torch==2.0.0"
+    - "torch==2.0.1"
     - "ftfy==6.1.1"
     - "scipy==1.9.3"
-    - "transformers==4.27.1"
-    - "accelerate==0.17.1"
     - "omegaconf==2.3.0"
   system_packages:
     - ffmpeg
     - libsm6
     - libxext6
-  run:
-    - "pip install compel==1.0.4"
 
 predict: "predict.py:Predictor"
