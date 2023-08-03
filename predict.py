@@ -1,9 +1,14 @@
+import json
 import os
-from typing import Iterator
+import re
+import shutil
+import subprocess
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from cog import BasePredictor, Input, Path
-from compel import Compel
 from diffusers import (
     DDIMScheduler,
     DPMSolverMultistepScheduler,
@@ -18,14 +23,31 @@ from diffusers import (
 from diffusers.pipelines.stable_diffusion.safety_checker import (
     StableDiffusionSafetyChecker,
 )
+from transformers import CLIPImageProcessor
 
+from dataset_and_utils import TokenEmbeddingsHandler
 
-MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
-LORA_MODEL_ID = "artificialguybr/360Redmond"
+SDXL_MODEL_CACHE = "./sdxl-cache"
+REFINER_MODEL_CACHE = "./refiner-cache"
+SAFETY_CACHE = "./safety-cache"
+FEATURE_EXTRACTOR = "./feature-extractor"
+LORA_CACHE = "./lora-cache"
 LORA_FILE_NAME = "View360.safetensors"
-MODEL_CACHE = "diffusers-cache"
-SAFETY_CACHE = "safety-cache"
 
+
+class KarrasDPM:
+    def from_config(config):
+        return DPMSolverMultistepScheduler.from_config(config, use_karras_sigmas=True)
+
+SCHEDULERS = {
+    "DDIM": DDIMScheduler,
+    "DPMSolverMultistep": DPMSolverMultistepScheduler,
+    "HeunDiscrete": HeunDiscreteScheduler,
+    "KarrasDPM": KarrasDPM,
+    "K_EULER_ANCESTRAL": EulerAncestralDiscreteScheduler,
+    "K_EULER": EulerDiscreteScheduler,
+    "PNDM": PNDMScheduler,
+}
 
 def patch_conv(**patch):
     cls = torch.nn.Conv2d
@@ -43,34 +65,64 @@ patch_conv(padding_mode="circular")
 class Predictor(BasePredictor):
     def setup(self):
         """Load the model into memory to make running multiple predictions efficient"""
-        print("Loading pipeline...")
+        start = time.time()
+        self.tuned_model = False
 
-        print("Loading txt2img...")
-        self.txt2img_pipe = DiffusionPipeline.from_pretrained(
-            MODEL_ID,
-            cache_dir=MODEL_CACHE,
-            local_files_only=True,
-            torch_dtype=torch.float16,
-            use_safetensors=True,
-            variant="fp16",
-        ).to("cuda")
-
-        self.txt2img_pipe.load_lora_weights(
-            ".", weight_name=f"./{MODEL_CACHE}/{LORA_FILE_NAME}")
-
+        print("Loading safety checker...")
         self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
             SAFETY_CACHE, torch_dtype=torch.float16
         ).to("cuda")
+        self.feature_extractor = CLIPImageProcessor.from_pretrained(FEATURE_EXTRACTOR)
+
+        print("Loading sdxl txt2img pipeline...")
+        self.txt2img_pipe = DiffusionPipeline.from_pretrained(
+            SDXL_MODEL_CACHE,
+            torch_dtype=torch.float16,
+            use_safetensors=True,
+            variant="fp16",
+        )
+        self.txt2img_pipe.to("cuda")
+
+        # print("Loading sdxl txt2img lora weights...")
+        # self.txt2img_pipe.load_lora_weights(
+        #     ".", weight_name=f"{LORA_CACHE}/{LORA_FILE_NAME}")
+
+        print("Loading SDXL refiner pipeline...")
+        print("Loading refiner pipeline...")
+        self.refiner = DiffusionPipeline.from_pretrained(
+            REFINER_MODEL_CACHE,
+            text_encoder_2=self.txt2img_pipe.text_encoder_2,
+            vae=self.txt2img_pipe.vae,
+            torch_dtype=torch.float16,
+            use_safetensors=True,
+            variant="fp16",
+        )
+        self.refiner.to("cuda")
+
+        print("setup took: ", time.time() - start)
+
+
+    def run_safety_checker(self, image):
+        safety_checker_input = self.feature_extractor(image, return_tensors="pt").to(
+            "cuda"
+        )
+        np_image = [np.array(val) for val in image]
+        image, has_nsfw_concept = self.safety_checker(
+            images=np_image,
+            clip_input=safety_checker_input.pixel_values.to(torch.float16),
+        )
+        return image, has_nsfw_concept
+
 
     @torch.inference_mode()
     def predict(
         self,
         prompt: str = Input(
             description="Input prompt",
-            default="a photo of an astronaut riding a horse on mars",
+            default="An astronaut riding a rainbow unicorn",
         ),
         negative_prompt: str = Input(
-            description="Specify things to not see in the output",
+            description="Input Negative Prompt",
             default="",
         ),
         width: int = Input(
@@ -88,89 +140,109 @@ class Predictor(BasePredictor):
         num_outputs: int = Input(
             description="Number of images to output.",
             ge=1,
-            le=10,
+            le=4,
             default=1,
+        ),
+        scheduler: str = Input(
+            description="scheduler",
+            choices=SCHEDULERS.keys(),
+            default="DDIM",
         ),
         num_inference_steps: int = Input(
             description="Number of denoising steps", ge=1, le=500, default=50
         ),
         guidance_scale: float = Input(
-            description="Scale for classifier-free guidance", ge=1, le=20, default=7.5
-        ),
-        scheduler: str = Input(
-            default="DPMSolverMultistep",
-            choices=[
-                "DDIM",
-                "DPMSolverMultistep",
-                "HeunDiscrete",
-                "K_EULER_ANCESTRAL",
-                "K_EULER",
-                "KLMS",
-                "PNDM",
-                "UniPCMultistep",
-            ],
-            description="Choose a scheduler.",
+            description="Scale for classifier-free guidance", ge=1, le=50, default=7.5
         ),
         seed: int = Input(
             description="Random seed. Leave blank to randomize the seed", default=None
         ),
-    ) -> Iterator[Path]:
+        refine: str = Input(
+            description="Which refine style to use",
+            choices=["no_refiner", "expert_ensemble_refiner", "base_image_refiner"],
+            default="no_refiner",
+        ),
+        high_noise_frac: float = Input(
+            description="for expert_ensemble_refiner, the fraction of noise to use",
+            default=0.8,
+            le=1.0,
+            ge=0.0,
+        ),
+        refine_steps: int = Input(
+            description="for base_image_refiner, the number of steps to refine, defaults to num_inference_steps",
+            default=None,
+        ),
+        apply_watermark: bool = Input(
+            description="Applies a watermark to enable determining if an image is generated in downstream applications. If you have other provisions for generating or deploying images safely, you can use this to disable watermarking.",
+            default=True
+        )
+    ) -> List[Path]:
         """Run a single prediction on the model"""
-
-        print("Using txt2img pipeline")
-        pipe = self.txt2img_pipe
-        extra_kwargs = {
-            "width": width,
-            "height": height,
-        }
-
         if seed is None:
             seed = int.from_bytes(os.urandom(2), "big")
         print(f"Using seed: {seed}")
+        
+        sdxl_kwargs = {}
+        print(f"Prompt: {prompt}")
+        print("txt2img mode")
+        sdxl_kwargs["width"] = width
+        sdxl_kwargs["height"] = height
+        pipe = self.txt2img_pipe
 
-        # if width * height > 786432:
-        #    raise ValueError(
-        #        "Maximum size is 1024x768 or 768x1024 pixels, because of memory limits. Please select a lower width or height."
-        #    )
+        if refine == "expert_ensemble_refiner":
+            sdxl_kwargs["output_type"] = "latent"
+            sdxl_kwargs["denoising_end"] = high_noise_frac
+        elif refine == "base_image_refiner":
+            sdxl_kwargs["output_type"] = "latent"
 
-        pipe.scheduler = make_scheduler(scheduler, pipe.scheduler.config)
-        pipe.safety_checker = self.safety_checker
+        if not apply_watermark:
+            # toggles watermark for this prediction
+            watermark_cache = pipe.watermark
+            pipe.watermark = None
+            self.refiner.watermark = None
 
-        result_count = 0
-        for idx in range(num_outputs):
-            this_seed = seed + idx
-            generator = torch.Generator("cuda").manual_seed(this_seed)
-            output = pipe(
-                prompt=[prompt] * num_outputs,
-                negative_prompt=[negative_prompt] * num_outputs,
-                guidance_scale=guidance_scale,
-                generator=generator,
-                num_inference_steps=num_inference_steps,
-                **extra_kwargs,
-            )
+        pipe.scheduler = SCHEDULERS[scheduler].from_config(pipe.scheduler.config)
+        generator = torch.Generator("cuda").manual_seed(seed)
 
-            if output.nsfw_content_detected and output.nsfw_content_detected[0]:
+        common_args = {
+            "prompt": [prompt] * num_outputs,
+            "negative_prompt": [negative_prompt] * num_outputs,
+            "guidance_scale": guidance_scale,
+            "generator": generator,
+            "num_inference_steps": num_inference_steps,
+        }
+        output = pipe(**common_args, **sdxl_kwargs)
+
+        if refine in ["expert_ensemble_refiner", "base_image_refiner"]:
+            refiner_kwargs = {
+                "image": output.images,
+            }
+
+            if refine == "expert_ensemble_refiner":
+                refiner_kwargs["denoising_start"] = high_noise_frac
+            if refine == "base_image_refiner" and refine_steps:
+                common_args["num_inference_steps"] = refine_steps
+
+            output = self.refiner(**common_args, **refiner_kwargs)
+
+        if not apply_watermark:
+            pipe.watermark = watermark_cache
+            self.refiner.watermark = watermark_cache
+
+        _, has_nsfw_content = self.run_safety_checker(output.images)
+
+        output_paths = []
+        for i, nsfw in enumerate(has_nsfw_content):
+            if nsfw:
+                print(f"NSFW content detected in image {i}")
                 continue
+            output_path = f"/tmp/out-{i}.png"
+            output.images[i].save(output_path)
+            output_paths.append(Path(output_path))
 
-            output_path = f"/tmp/seed-{this_seed}.png"
-            output.images[0].save(output_path)
-            yield Path(output_path)
-            result_count += 1
-
-        if result_count == 0:
+        if len(output_paths) == 0:
             raise Exception(
                 f"NSFW content detected. Try running it again, or try a different prompt."
             )
 
-
-def make_scheduler(name, config):
-    return {
-        "DDIM": DDIMScheduler.from_config(config),
-        "DPMSolverMultistep": DPMSolverMultistepScheduler.from_config(config),
-        "HeunDiscrete": HeunDiscreteScheduler.from_config(config),
-        "K_EULER_ANCESTRAL": EulerAncestralDiscreteScheduler.from_config(config),
-        "K_EULER": EulerDiscreteScheduler.from_config(config),
-        "KLMS": LMSDiscreteScheduler.from_config(config),
-        "PNDM": PNDMScheduler.from_config(config),
-        "UniPCMultistep": UniPCMultistepScheduler.from_config(config),
-    }[name]
+        return output_paths
